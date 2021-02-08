@@ -1,0 +1,234 @@
+---
+title: "Chicago Car Injuries"
+author: "Sumair Shah"
+date: "2/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(Cache = TRUE, cache.lazy = FALSE,warning = FALSE, message = FALSE,echo = TRUE,dpi = 180, fig.width = 8, fig.height = 5)
+
+```
+
+build a model to predict whether a crash involved an injury or not
+
+```{r load packages}
+library(tidyverse)
+library(lubridate)
+library(RSocrata)
+library(skimr)
+library(plotly)
+library(tidymodels)
+library(baguette)
+library(themis)
+library(here)
+
+theme_set(theme_light())
+
+years_ago <- today() - years(2) # takes todays date - two years from today
+
+crash_url <- glue::glue("https://data.cityofchicago.org/Transportation/Traffic-Crashes-Crashes/85ca-t3if?$where=CRASH_DATE > '{years_ago}'")
+
+crash_raw <- as_tibble(read.socrata(crash_url))
+
+```
+
+```{r}
+crash <- crash_raw %>%
+  arrange(desc(crash_date)) %>%
+  transmute(
+    injuries = if_else(injuries_total > 0, "injuries", "none"),
+    crash_date,
+    crash_hour,
+    report_type = if_else(report_type == "", "UNKNOWN", report_type),
+    num_units,
+    posted_speed_limit,
+    weather_condition,
+    lighting_condition,
+    roadway_surface_cond,
+    first_crash_type,
+    trafficway_type,
+    prim_contributory_cause,
+    latitude, longitude
+  ) %>%
+  na.omit()
+
+
+
+```
+
+```{r}
+crash$date <- ymd_hms(crash$crash_date)
+
+ggplotly(crash %>%
+  mutate(date = round_date(date,"week")) %>%
+  count(date, injuries) %>% 
+  filter(date != last(date), date!= first(date)) %>%  ggplot(aes(x = date, y = n,color = injuries)) +
+  geom_line(size = 1.5,alpha = 0.9) + scale_y_continuous(limits = c(0,NA)) + labs(x = "Date", y = "Number of injuries",title = "Number of Injuries per week"))
+
+
+```
+
+
+```{r}
+
+ggplotly(crash %>%
+  mutate(date = round_date(date,"week")) %>%
+  count(date, injuries) %>% 
+  filter(date != last(date), date!= first(date)) %>% 
+    group_by(date) %>% mutate(percent_injury = n/sum(n)) %>% 
+    ungroup() %>% 
+  filter(injuries == "injuries") %>% 
+    ggplot(aes(x = date, y = percent_injury)) +
+  geom_line(size = 1.5, alpha = 0.7,color = "midnightblue")  + scale_y_continuous(limits = c(0,NA), labels = 
+  scales::percent_format()) + labs(y = "injury percentage", x = "Date", title = "Percent injury by Date"))
+  
+
+
+
+```
+
+
+```{r}
+ggplotly(crash %>% 
+  mutate(crash_date = wday(crash_date,label = T)) %>% 
+  count(crash_date,injuries) %>% group_by(injuries) %>% 
+  mutate(percent = n/ sum(n)) %>% 
+  ungroup() %>% 
+  ggplot(aes(percent,crash_date,fill = injuries)) + 
+  geom_col(position = "dodge",alpha = 0.8) + 
+  scale_x_continuous(labels = scales::percent_format()))
+
+```
+
+```{r}
+ggplotly(crash %>% 
+  count(first_crash_type,injuries) %>% 
+  mutate(first_crash_type = fct_reorder(first_crash_type,n)) %>% 
+  group_by(injuries) %>% 
+  mutate(percent = n/ sum(n)) %>% 
+  ungroup() %>% 
+  group_by(first_crash_type) %>% 
+  filter(sum(n) > 1e4) %>% 
+  ggplot(aes(percent,first_crash_type,fill = injuries)) + 
+  geom_col(position = "dodge",alpha = 0.8) + 
+  scale_x_continuous(labels = scales::percent_format()))
+
+```
+
+
+```{r}
+
+crash %>% 
+  filter(latitude > 0) %>% 
+  ggplot(aes(longitude,latitude, color = injuries)) + 
+  geom_point(size = 0.5,alpha = 0.3) +
+  labs(color = NULL) + 
+  scale_color_manual(values = c("deeppink","gray80"))
+
+
+
+```
+
+```{r}
+
+set.seed(2021)
+crash_split <- initial_split(crash,strata = injuries)
+crash_train <- training(crash_split)
+crash_test <- testing(crash_split)
+
+set.seed(123)
+
+crash_folds <- vfold_cv(crash_train,strata = injuries)
+
+
+
+```
+
+```{r}
+crash_rec <- recipe(injuries ~.,data = crash_train) %>% 
+  step_date(crash_date) %>% 
+  step_rm(crash_date) %>% 
+  step_other(weather_condition,first_crash_type,trafficway_type,prim_contributory_cause, other = "OTHER") %>% 
+  step_downsample(injuries)
+
+bag_spec <- bag_tree(min_n = 10) %>% 
+  set_engine("rpart",times = 25) %>% 
+  set_mode("classification")
+
+
+crash_wf <- workflow() %>% 
+  add_recipe(crash_rec) %>% 
+  add_model(bag_spec)
+
+crash_wf
+
+```
+
+```{r}
+doParallel::registerDoParallel()
+crash_res <- fit_resamples(
+  crash_wf,
+  crash_folds
+)
+
+
+
+```
+
+```{r}
+collect_metrics(crash_res)
+```
+
+
+```{r}
+
+Crash_fit <- last_fit(crash_wf,crash_split)
+collect_metrics(Crash_fit)
+
+
+```
+
+
+
+```{r}
+
+crash_imp <- Crash_fit$.workflow[[1]] %>% 
+  pull_workflow_fit()
+
+ggplotly(crash_imp$fit$imp %>% 
+  slice_max(value, n = 10) %>% 
+  ggplot(aes(value,fct_reorder(term,value))) + 
+  geom_col(alpha = 0.8,fill = "midnightblue") + 
+  labs(x = "Variable importance score", y = NULL, title = 'Feature Importance'))
+
+
+```
+
+```{r}
+
+ggplotly(collect_predictions(Crash_fit) %>% 
+roc_curve(injuries,.pred_injuries) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) + 
+  geom_line(size = 1.5,color = 'midnightblue') + 
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) + 
+  coord_equal())
+
+
+```
+
+```{r}
+
+crash_wf_model <- Crash_fit$.workflow[[1]]
+
+#predict(crash_wf_model,crash_test) ## these are my predictions, use crash_wf model to predict on new data
+
+
+
+```
+
+
